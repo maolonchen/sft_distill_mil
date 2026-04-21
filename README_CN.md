@@ -238,7 +238,7 @@ losses["total_loss"].backward()
 
 **通用层映射公式：**
 
-$$\text{student\_idx}(i) = i + |\{p \in P : p < i\}|$$
+$$\text{student{\_}idx}(i) = i + |\{p \in P : p < i\}|$$
 
 其中 $P$ 是插入位置集合。此公式适用于任意模型大小和策略。
 
@@ -357,7 +357,7 @@ sft_distill_mil/
 │   ├── example_instruction_response.jsonl
 │   └── example_plain_text.jsonl
 └── models/               # 本地模型文件
-    └── Qwen/Qwen3-0.6B/
+    └── Qwen/Qwen3-{...}/
 ```
 
 ## 许可证

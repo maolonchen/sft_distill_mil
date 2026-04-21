@@ -238,7 +238,7 @@ losses["total_loss"].backward()
 
 **General layer mapping formula:**
 
-$$\text{student\_idx}(i) = i + |\{p \in P : p < i\}|$$
+$$\text{student{\_}idx}(i) = i + |\{p \in P : p < i\}|$$
 
 where $P$ is the set of insert positions. This formula applies to any model size and strategy.
 
@@ -357,7 +357,7 @@ sft_distill_mil/
 │   ├── example_instruction_response.jsonl
 │   └── example_plain_text.jsonl
 └── models/               # Local model files
-    └── Qwen/Qwen3-0.6B/
+    └── Qwen/Qwen3-{...}/
 ```
 
 ## License
