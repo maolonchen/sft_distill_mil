@@ -152,14 +152,34 @@ python dl.py  # 下载 Qwen3-0.6B 到 models/ 目录
 
 > 自动转换为 `[{"role": "user", "content": instruction}, {"role": "assistant", "content": output}]`，支持可选的 `"system"` 字段。
 
-**格式 3 — Plain Text（向后兼容）**
+**格式 3 — Plain Text（推荐用于预训练风格语料）**
 
 ```jsonl
 {"text": "人工智能（Artificial Intelligence，简称AI）是计算机科学的一个分支..."}
 {"text": "近年来，大语言模型（LLM）在自然语言处理领域取得了突破性进展..."}
 ```
 
-> 转换为 `[{"role": "user", "content": text}]`。
+> 转换为 `[{"role": "assistant", "content": text}]`。整段文本作为训练目标（assistant 内容），符合 wikitext、ruozhiba 等预训练风格语料的惯例。开启 `--train_on_responses_only` 时整段仍然参与 loss 计算。
+
+**格式 4 — Messages with Thinking（Qwen3 思考模式）**
+
+```jsonl
+{"messages": [{"role": "user", "content": "1+1=?"}, {"role": "assistant", "content": "<think>\n基础算术。\n</think>\n\n1+1 等于 2。"}]}
+```
+
+> 当 assistant 内容含 `<think>...</think>` 时，chat template 会原样保留。带 think 与不带 think 的数据可以在同一个文件中自由混合，**不需要额外参数控制**。
+
+### 混合多种格式 / 多个文件
+
+`_to_messages` 按行内字段判断格式，因此 **单个 JSONL 文件可以自由混合 `messages`、`text`、`instruction/output` 三种格式**。
+
+需要混合多个文件时，直接 cat 即可：
+
+```bash
+cat data/ruozhiba.jsonl data/example_messages_with_system.jsonl data/facts.jsonl \
+    > data/_merged.jsonl
+python scripts/train.py --data_path data/_merged.jsonl ...
+```
 
 <details>
 <summary>样例文件</summary>
@@ -170,8 +190,9 @@ python dl.py  # 下载 Qwen3-0.6B 到 models/ 目录
 |------|------|
 | `example_messages_with_system.jsonl` | Messages（含 system） |
 | `example_messages_without_system.jsonl` | Messages（无 system） |
+| `example_messages_with_think.jsonl` | Messages（含 `<think>` 思考模式） |
 | `example_instruction_response.jsonl` | Instruction-Response |
-| `example_plain_text.jsonl` | Plain Text |
+| `example_plain_text.jsonl` | Plain Text（视为 assistant 内容） |
 
 </details>
 
@@ -343,6 +364,7 @@ model = AutoModelForCausalLM.from_pretrained("output/best")
 
 ### 实践
 python scripts/train.py --model_path XXX --data_path XXX --train_on_responses_only --lambda_kl 0.1 --lambda_feat 0.05 --epochs XXX --batch_size XXX --gradient_accumulation_steps 1 --lr XXX --warmup_ratio XXX
+python scripts/chat.py --model_path output/best
 
 ---
 

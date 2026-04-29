@@ -1,0 +1,3 @@
+{"messages": [{"role": "user", "content": "1 加 1 等于几？"}, {"role": "assistant", "content": "<think>\n这是一个非常基础的算术问题，1 + 1 = 2，直接给出答案即可。\n</think>\n\n1 加 1 等于 2。"}]}
+{"messages": [{"role": "user", "content": "如果一辆车以 60 公里/小时的速度行驶 2.5 小时，能走多远？"}, {"role": "assistant", "content": "<think>\n距离 = 速度 × 时间。\n速度是 60 公里/小时，时间是 2.5 小时。\n所以距离 = 60 × 2.5 = 150 公里。\n</think>\n\n这辆车能行驶 150 公里。计算过程：60 公里/小时 × 2.5 小时 = 150 公里。"}]}
+{"messages": [{"role": "system", "content": "你是一个善于推理的助手。"}, {"role": "user", "content": "小明有 3 个苹果，给了小红 1 个，又从妈妈那里得到 2 个，他现在有几个？"}, {"role": "assistant", "content": "<think>\n初始：3 个苹果\n给出去：-1 个，剩 2 个\n得到：+2 个，变成 4 个\n</think>\n\n小明现在有 4 个苹果。"}]}

@@ -152,14 +152,34 @@ Training data uses **JSONL** format (one JSON object per line). Three formats ar
 
 > Automatically converted to `[{"role": "user", "content": instruction}, {"role": "assistant", "content": output}]`. An optional `"system"` field is also supported.
 
-**Format 3 — Plain Text (backward compatible)**
+**Format 3 — Plain Text (recommended for pretrain-style corpora)**
 
 ```jsonl
 {"text": "Artificial Intelligence (AI) is a branch of computer science..."}
 {"text": "In recent years, large language models (LLMs) have achieved breakthrough progress..."}
 ```
 
-> Converted to `[{"role": "user", "content": text}]`.
+> Converted to `[{"role": "assistant", "content": text}]`. The entire text is used as the training target (assistant content), aligning with the convention of pretrain-style corpora (wikitext, ruozhiba, etc.). When `--train_on_responses_only` is enabled, the entire text still contributes to the loss.
+
+**Format 4 — Messages with Thinking (Qwen3 reasoning mode)**
+
+```jsonl
+{"messages": [{"role": "user", "content": "1+1=?"}, {"role": "assistant", "content": "<think>\nBasic arithmetic.\n</think>\n\n1+1 equals 2."}]}
+```
+
+> When the assistant content contains `<think>...</think>`, the chat template preserves it as-is. Data with and without thinking can be mixed freely in the same file — no extra flags required.
+
+### Mixing Multiple Formats / Files
+
+The `_to_messages` logic dispatches per-line based on which keys exist, so **a single JSONL file can mix `messages`, `text`, and `instruction/output` rows freely**.
+
+For multiple files, just concatenate them:
+
+```bash
+cat data/ruozhiba.jsonl data/example_messages_with_system.jsonl data/facts.jsonl \
+    > data/_merged.jsonl
+python scripts/train.py --data_path data/_merged.jsonl ...
+```
 
 <details>
 <summary>Sample Files</summary>
@@ -170,8 +190,9 @@ Four sample files are provided in the `data/` directory:
 |------|--------|
 | `example_messages_with_system.jsonl` | Messages with system prompt |
 | `example_messages_without_system.jsonl` | Messages without system prompt |
+| `example_messages_with_think.jsonl` | Messages with `<think>` reasoning mode |
 | `example_instruction_response.jsonl` | Instruction-Response |
-| `example_plain_text.jsonl` | Plain text |
+| `example_plain_text.jsonl` | Plain text (treated as assistant content) |
 
 </details>
 

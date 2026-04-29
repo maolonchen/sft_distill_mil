@@ -6,6 +6,7 @@ Block Expansion 微调训练模块
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 import torch
@@ -50,7 +51,7 @@ class SFTDataset(Dataset):
             messages.append({"role": "assistant", "content": item["output"]})
             return messages
         if "text" in item:
-            return [{"role": "user", "content": item["text"]}]
+            return [{"role": "assistant", "content": item["text"]}]
         raise ValueError(f"无法识别的数据格式，keys: {list(item.keys())}")
 
     def _load_data(self, data_path: str) -> list[list[dict[str, str]]]:
@@ -72,14 +73,22 @@ class SFTDataset(Dataset):
         messages = self.samples[idx]
 
         if self.train_on_responses_only:
+            # 特殊情况：纯 text/单 assistant 样本（无 user prompt），整段算 loss
+            is_pure_assistant = (
+                len(messages) == 1 and messages[0].get("role") == "assistant"
+            )
+
             # 找到最后一个 assistant 开始的位置
             # 1. 拿到去除最后一个 assistant 内容的 prompt
             prompt_messages = messages[:-1]
-            prompt_text = self.tokenizer.apply_chat_template(
-                prompt_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
+            if is_pure_assistant:
+                prompt_text = ""
+            else:
+                prompt_text = self.tokenizer.apply_chat_template(
+                    prompt_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
             # 2. 拿到完整的文本
             full_text = self.tokenizer.apply_chat_template(
                 messages,
@@ -95,23 +104,23 @@ class SFTDataset(Dataset):
                 return_tensors="pt",
             )
 
-            enc_prompt = self.tokenizer(
-                prompt_text,
-                max_length=self.max_seq_length,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-
             input_ids = enc_full["input_ids"].squeeze(0)
             attention_mask = enc_full["attention_mask"].squeeze(0)
             labels = input_ids.clone()
             labels[attention_mask == 0] = -100
 
             # 将 prompt 部分的 labels 置为 -100
-            # 比较简单的做法：看 prompt_text tokenize 后的长度
-            prompt_len = enc_prompt["attention_mask"].sum().item()
-            # 为了防止特殊 token (如 bos) 的差异，我们直接用 prompt_len 作为分界线
+            if is_pure_assistant:
+                prompt_len = 0
+            else:
+                enc_prompt = self.tokenizer(
+                    prompt_text,
+                    max_length=self.max_seq_length,
+                    truncation=True,
+                    padding="max_length",
+                    return_tensors="pt",
+                )
+                prompt_len = enc_prompt["attention_mask"].sum().item()
             labels[:prompt_len] = -100
 
         else:
@@ -170,9 +179,11 @@ def train():
 
     # SFT 参数
     parser.add_argument("--train_on_responses_only", action="store_true", help="如果设置，则仅在 assistant 的回复部分计算 loss（标准的 SFT 做法）")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="启用梯度检查点，可显著降低显存占用（约慢 25%）")
 
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=500)
+    parser.add_argument("--save_total_limit", type=int, default=3, help="最多保留多少个最近的 checkpoint，超出则删除最旧的")
     args = parser.parse_args()
 
     # 设备
@@ -207,6 +218,14 @@ def train():
     ).to(device)
     print(f"Strategy: {args.strategy}, Insert after layers: {model.insert_positions}")
     print(f"Student layers: {len(model.student.model.layers)} (original: {len(model.teacher.model.layers)})")
+
+    # 梯度检查点（节省显存，训练速度变慢约 25%）
+    if args.gradient_checkpointing:
+        model.student.gradient_checkpointing_enable()
+        # 训练时关闭 use_cache 以兼容 gradient checkpointing
+        if hasattr(model.student, "config"):
+            model.student.config.use_cache = False
+        print("Gradient checkpointing enabled.")
 
     # 可训练参数统计
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -282,6 +301,16 @@ def train():
                     model.student.save_pretrained(ckpt_dir)
                     tokenizer.save_pretrained(ckpt_dir)
                     print(f"Checkpoint saved to {ckpt_dir}")
+
+                    # 滚动删除：仅保留最近的 save_total_limit 个 checkpoint
+                    if args.save_total_limit and args.save_total_limit > 0:
+                        ckpts = sorted(
+                            Path(args.output_dir).glob("checkpoint-*"),
+                            key=lambda p: int(p.name.split("-")[-1]),
+                        )
+                        for old in ckpts[:-args.save_total_limit]:
+                            shutil.rmtree(old, ignore_errors=True)
+                            print(f"Removed old checkpoint: {old}")
 
         # Epoch 结束
         avg_epoch_loss = epoch_loss / len(dataloader)
