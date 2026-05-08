@@ -126,7 +126,7 @@ uv sync
 ### 下载模型
 
 ```bash
-python dl.py  # 下载 Qwen3-0.6B 到 models/ 目录
+python dl.py  # 下载 Qwen3-... 到 models/ 目录
 ```
 
 ### 准备数据集
