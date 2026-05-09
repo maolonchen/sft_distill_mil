@@ -1,8 +1,8 @@
 <div align="center">
 
-# SFT-Distill-MIL
+# antiForget-dk-sft
 
-**Block Expansion + Knowledge Distillation for LLM Fine-tuning**
+**Anti-Catastrophic Forgetting + Block Expansion + Knowledge Distillation for LLM Fine-tuning**
 
 Mitigating catastrophic forgetting during Qwen fine-tuning via block expansion and knowledge distillation.
 
