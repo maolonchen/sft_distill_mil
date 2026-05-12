@@ -1,7 +1,7 @@
 """
-Block Expansion 微调训练模块
+Block Expansion 局部蒸馏微调训练模块
 
-包含数据集类和训练入口
+包含数据集类和训练入口。
 """
 
 import argparse
@@ -150,7 +150,7 @@ class SFTDataset(Dataset):
 
 
 def train():
-    parser = argparse.ArgumentParser(description="Block Expansion SFT Training")
+    parser = argparse.ArgumentParser(description="Block Expansion Local Distillation SFT Training")
     parser.add_argument("--model_path", type=str, default="models/Qwen/Qwen3-0.6B")
     parser.add_argument("--data_path", type=str, required=True, help="JSONL 数据文件路径")
     parser.add_argument("--output_dir", type=str, default="output")
@@ -172,7 +172,7 @@ def train():
         "--strategy_positions", type=str, default=None,
         help="custom 策略的插入位置，逗号分隔，如 '0,13,27'",
     )
-    # 蒸馏参数
+    # 局部蒸馏参数
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--lambda_kl", type=float, default=0.5)
     parser.add_argument("--lambda_feat", type=float, default=0.1)
@@ -207,7 +207,7 @@ def train():
     elif args.strategy == "custom" and args.strategy_positions:
         strategy_kwargs["positions"] = [int(x) for x in args.strategy_positions.split(",")]
 
-    # 模型
+    # 模型（无 Teacher，单模型 + 局部蒸馏）
     model = BlockExpansionWrapper(
         model_path=args.model_path,
         strategy=args.strategy,
@@ -217,27 +217,24 @@ def train():
         lambda_feat=args.lambda_feat,
     ).to(device)
     print(f"Strategy: {args.strategy}, Insert after layers: {model.insert_positions}")
-    print(f"Student layers: {len(model.student.model.layers)} (original: {len(model.teacher.model.layers)})")
+    print(f"Expanded model layers: {len(model.model.model.layers)} "
+          f"(identity blocks: {len(model.identity_indices)})")
 
     # 梯度检查点（节省显存，训练速度变慢约 25%）
     if args.gradient_checkpointing:
-        model.student.gradient_checkpointing_enable()
-        # 训练时关闭 use_cache 以兼容 gradient checkpointing
-        if hasattr(model.student, "config"):
-            model.student.config.use_cache = False
+        model.model.gradient_checkpointing_enable()
+        if hasattr(model.model, "config"):
+            model.model.config.use_cache = False
         print("Gradient checkpointing enabled.")
 
-    # 可训练参数统计
+    # 可训练参数统计（仅恒等块）
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Trainable: {trainable:,} / Total: {total:,} ({100*trainable/total:.1f}%)")
 
-    # Optimizer（只优化 student 的参数）
-    optimizer = AdamW(
-        model.student.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    # Optimizer（只优化恒等块的参数）
+    trainable_params = model.get_trainable_params()
+    optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
     # Scheduler
     total_steps = len(dataloader) * args.epochs // args.gradient_accumulation_steps
@@ -250,7 +247,7 @@ def train():
     best_loss = float("inf")
 
     for epoch in range(args.epochs):
-        model.student.train()
+        model.train()
         epoch_loss = 0.0
         optimizer.zero_grad()
 
@@ -273,8 +270,8 @@ def train():
             epoch_loss += losses["total_loss"].item()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(model.student.parameters(), 1.0)
+                # 梯度裁剪（仅裁剪恒等块参数）
+                torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -298,7 +295,7 @@ def train():
                 if global_step % args.save_interval == 0:
                     ckpt_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
                     ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    model.student.save_pretrained(ckpt_dir)
+                    model.model.save_pretrained(ckpt_dir)
                     tokenizer.save_pretrained(ckpt_dir)
                     print(f"Checkpoint saved to {ckpt_dir}")
 
@@ -321,13 +318,13 @@ def train():
             best_loss = avg_epoch_loss
             best_dir = Path(args.output_dir) / "best"
             best_dir.mkdir(parents=True, exist_ok=True)
-            model.student.save_pretrained(best_dir)
+            model.model.save_pretrained(best_dir)
             tokenizer.save_pretrained(best_dir)
             print(f"Best model saved to {best_dir}")
 
     # 最终保存
     final_dir = Path(args.output_dir) / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    model.student.save_pretrained(final_dir)
+    model.model.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
     print(f"Final model saved to {final_dir}")

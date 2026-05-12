@@ -2,9 +2,9 @@
 
 # antiForget-dk-sft
 
-**Anti Catastrophic Forgetting + Block Expansion + Knowledge Distillation for LLM Fine-tuning**
+**Anti-Catastrophic Forgetting via Local Distributional Anchoring at Identity Blocks**
 
-Mitigating catastrophic forgetting during Qwen fine-tuning via block expansion and self-distributing distillation balance.
+Block Expansion provides the architecture. Distributional anchoring provides the protection.
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.11%2B-ee4c2c.svg)](https://pytorch.org/)
@@ -14,94 +14,130 @@ Mitigating catastrophic forgetting during Qwen fine-tuning via block expansion a
 
 ---
 
-## Why Block Expansion?
+## Core Innovation: Local Distributional Anchoring
 
-A core challenge in fine-tuning large models is **catastrophic forgetting** — learning new tasks overwrites old knowledge. Traditional approaches (L2 regularization, EWC, etc.) try to constrain parameters, but their effectiveness is limited in billion-parameter spaces.
+Block Expansion (inserting identity-mapping layers into a pretrained model) is a known technique for adding capacity without modifying existing parameters. However, prior work leaves a critical gap: **the inserted blocks can distort the internal representations flowing through frozen layers, causing cascading degradation of the model's original capabilities.**
 
-Block Expansion takes a different approach:
+We introduce **Local Distributional Anchoring** — at every identity block insertion point, we anchor the block's output distribution to its input distribution, creating a self-referential constraint that preserves the model's predictive behavior while allowing new knowledge to be absorbed:
 
-> **Instead of constraining old parameters, insert new ones.** New knowledge gets its own storage space, and old knowledge is naturally preserved.
+> **The model's own pre-block distribution serves as an in-situ reference.** At each insertion point, the identity block faces a distributional tug-of-war: task loss pushes it toward new knowledge, while local KL divergence and feature distillation anchor it to the original distribution.
 
-The idea is simple — insert **identity blocks** between Transformer layers. Initially, identity blocks are transparent (input = output), so the expanded model behaves identically to the original. During training, identity blocks gradually grow from zero into meaningful layers.
+```
+ At each identity block insertion point:
+
+   Frozen Layer i output (h_in)
+          │
+          ↓  ┌─────────────────────────────────────────┐
+          │  │         Identity Block (trainable)        │
+          │  └────────────────────┬────────────────────┘
+          │                       │ output (h_out)
+          │                       │
+          │    ┌──────────────────┤
+          │    │  Distributional  │
+          │    │    Anchoring     │
+          │    │                  │
+          │    │  MSE(h_in, h_out)        ← hidden-space anchor
+          │    │  KL(P_in ‖ P_out)        ← output-space anchor
+          │    │  where P = softmax(lm_head(h) / τ)
+          │    └──────────────────┤
+          │                       │
+          ↓                       ↓
+   → Frozen Layer i+1 → ... → Final Output → CE Loss (task learning)
+```
+
+This creates a **dual-space constraint** at every insertion point:
+- **Hidden space (MSE)**: keeps numerical representations close — structural preservation
+- **Output space (KL)**: keeps the predicted token distribution close — behavioral preservation
+
+The two spaces are complementary. MSE is dimension-agnostic and cheap, but blind to which dimensions matter. KL projects through `lm_head` into vocabulary space, automatically focusing on the directions that actually shift predictions. A perturbation that MSE considers negligible but that would flip the model's top prediction is caught by KL — this is the key to preventing **cascading distortion** through subsequent frozen layers.
+
+### Why This Works: The Distributional Tug-of-War
+
+During training, each identity block is pulled by opposing forces:
+
+| Force | Direction | Effect |
+|-------|-----------|--------|
+| Task Loss (CE) | Push h_out away from h_in | Absorb new task knowledge |
+| Local KL | Pull output distribution back toward input distribution | Preserve predictive behavior |
+| Local MSE | Pull h_out back toward h_in | Preserve representational structure |
+
+The balance is controlled by $\lambda_{kl}$ and $\lambda_{feat}$. The identity block grows from zero, learning to satisfy both the new task and the distributional anchor — absorbing new knowledge without corrupting the knowledge already encoded in frozen layers.
 
 ```
  Original (28 layers)              Expanded (42 layers, second_half)
  ──────────────────────            ──────────────────────────────────
- Layer 0                           Layer 0  (original)
- Layer 1                           Layer 1  (original)
+ Layer 0                           Layer 0  (frozen)
+ Layer 1                           Layer 1  (frozen)
  ...                               ...
- Layer 13                          Layer 13 (original)
-                                   Layer 14 (original)
- Layer 14                   ──→    [ID-14]  (identity block) ← new!
- Layer 15                          Layer 15 (original)
- ...                               [ID-15]  (identity block) ← new!
+ Layer 13                          Layer 13 (frozen)
+                                   Layer 14 (frozen)
+ Layer 14                   ──→    [ID-14]  (trainable) ← new!
+ Layer 15                          Layer 15 (frozen)
+ ...                               [ID-15]  (trainable) ← new!
  Layer 27                          ...
-                                   Layer 27 (original)
-                                   [ID-27]  (identity block) ← new!
+                                   Layer 27 (frozen)
+                                   [ID-27]  (trainable) ← new!
 ```
 
-### How Identity Blocks Work
+### Identity Block Initialization
 
-Qwen's DecoderLayer uses a Pre-Norm residual structure. By zeroing out the weights of `o_proj` (the last layer in attention) and `down_proj` (the last layer in MLP):
+Qwen's DecoderLayer uses Pre-Norm residual structure. Zeroing `o_proj` and `down_proj` weights:
 
 ```python
-# Before zeroing: normal Transformer layer
-x = residual + Attention(x)   # o_proj output is non-zero
-x = residual + MLP(x)         # down_proj output is non-zero
+# Normal layer: output ≠ input
+x = residual + Attention(x)
+x = residual + MLP(x)
 
-# After zeroing: exact identity mapping
-x = residual + 0 = residual   # attention branch is zero, residual passes through
-x = residual + 0 = residual   # MLP branch is zero, residual passes through
+# Identity block: output = input (exact)
+x = residual + 0 = residual   # attention branch zeroed
+x = residual + 0 = residual   # MLP branch zeroed
 ```
 
-During training, gradients update these zero-initialized weights, and identity blocks gradually learn new feature transformations.
+At initialization, the expanded model behaves identically to the original. Training gradually grows identity blocks from zero into meaningful layers.
 
 ---
 
-## Triple Loss Design
-
-Block expansion alone is not enough — original layer weights can still be indirectly perturbed by gradients from the new task. Therefore, a triple loss is introduced:
+## Loss Formulation
 
 $$
-\mathcal{L}_{total} = \mathcal{L}_{task} + \lambda_{kl} \cdot \mathcal{L}_{kl} + \lambda_{feat} \cdot \mathcal{L}_{feat}
+\mathcal{L}_{total} = \mathcal{L}_{task} + \lambda_{kl} \cdot \mathcal{L}_{kl}^{local} + \lambda_{feat} \cdot \mathcal{L}_{feat}^{local}
 $$
 
-| Loss | Formula | Purpose |
-|------|---------|---------|
-| **Task** | Cross-Entropy on labels | Learn the new task |
-| **KL Distillation** | $\tau^2 \cdot KL(\text{softmax}(S/\tau) \;\|\|\; \text{softmax}(T/\tau))$ | Match Student output distribution to Teacher |
-| **Feature Distillation** | $\frac{1}{N}\sum_i \text{MSE}(S_{hidden[i]},\; T_{hidden[i]})$ | Align intermediate representations layer by layer |
+| Loss | Formula | Space |
+|------|---------|-------|
+| **Task Loss** | Cross-entropy on labels | Output |
+| **Local KL** | $\frac{1}{K}\sum_{k} KL(\text{softmax}(\text{lm\_head}(h_{in}^{(k)})/\tau) \;\|\|\; \text{softmax}(\text{lm\_head}(h_{out}^{(k)})/\tau))$ | Output distribution |
+| **Local MSE** | $\frac{1}{K}\sum_{k} \text{MSE}(h_{in}^{(k)},\; h_{out}^{(k)})$ | Hidden state |
 
-- **KL distillation** protects output-level knowledge (syntax, commonsense, reasoning preferences)
-- **Feature distillation** protects internal representation-level knowledge (feature space structure)
-- Together they cover the full knowledge chain from bottom layers to output
+### Implementation Details
+
+- `h_in` is **detached** at each identity block — each block trains independently, no gradient cross-talk
+- `P_in` is computed under `torch.no_grad()` — zero backward overhead for the reference side
+- Both KL and MSE are averaged over all $K$ identity blocks and computed in **float32**
 
 <details>
 <summary>Architecture Diagram</summary>
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  BlockExpansionWrapper                  │
-│                                                         │
-│  ┌──────────────────┐     ┌──────────────────────────┐  │
-│  │ Teacher (frozen) │     │     Student (trainable)  │  │
-│  │  ┌──────────────┐│     │  ┌──────────────────────┐│  │
-│  │  │ Layer 0      ││     │  │ Layer 0 (original)   ││  │
-│  │  │ Layer 1      ││     │  │ Layer 1 (original)   ││  │
-│  │  │ ...          ││     │  │ ...                  ││  │
-│  │  │ Layer 14     ││────→│  │ Layer 14 (original)  ││  │
-│  │  │ Layer 15     ││ MSE │  │ [ID-14] (identity)   ││  │
-│  │  │ ...          ││     │  │ Layer 15 (original)  ││  │
-│  │  │ Layer 27     ││     │  │ [ID-15] (identity)   ││  │
-│  │  └──────┬───────┘│     │  │ ...                  ││  │
-│  │         │ logits │     │  │ Layer 27 (original)  ││  │
-│  │         ↓        │     │  │ [ID-27] (identity)   ││  │
-│  │    KL div  ←─────│────→│  └──────────┬───────────┘│  │
-│  └──────────────────┘     │             │ logits     │  │
-│                           │             ↓            │  │
-│                           │      CE Loss (labels)    │  │
-│                           └──────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│               Single Expanded Model                        │
+│                                                           │
+│  Layer 0 (frozen) ──→ ... ──→ Layer 14 (frozen)          │
+│                                    │                      │
+│                                    ↓ h_in (detached)      │
+│                              ┌──────────────┐             │
+│                              │  ID-14       │ (trainable) │
+│                              └──────┬───────┘             │
+│                                     │ h_out               │
+│                          ┌──────────┼──────────┐          │
+│                          │  MSE(h_in, h_out)   │          │
+│                          │  KL(lm(h_in)‖lm(h_out))│       │
+│                          └──────────┴──────────┘          │
+│                                     │                     │
+│                                     ↓                     │
+│  Layer 15 (frozen) ──→ ... ──→ [Final Output] ──→ CE Loss │
+│                                                           │
+└───────────────────────────────────────────────────────────┘
 ```
 
 </details>
@@ -113,11 +149,8 @@ $$
 ### Installation
 
 ```bash
-# Clone & install
 git clone <repo-url>
 cd sft_distill_mil
-
-# with uv
 uv sync
 ```
 
@@ -155,7 +188,7 @@ Training data uses **JSONL** format (one JSON object per line). Three formats ar
 
 ```jsonl
 {"text": "Artificial Intelligence (AI) is a branch of computer science..."}
-{"text": "In recent years, large language models (LLMs) have achieved breakthrough progress..."}
+{"text": "In recent years, large language models (LLM) have achieved breakthrough progress..."}
 ```
 
 > Converted to `[{"role": "assistant", "content": text}]`. The entire text is used as the training target (assistant content), aligning with the convention of pretrain-style corpora (wikitext, ruozhiba, etc.). When `--train_on_responses_only` is enabled, the entire text still contributes to the loss.
@@ -163,10 +196,10 @@ Training data uses **JSONL** format (one JSON object per line). Three formats ar
 **Format 4 — Messages with Thinking (Qwen3 reasoning mode)**
 
 ```jsonl
-{"messages": [{"role": "user", "content": "1+1=?"}, {"role": "assistant", "content": "<think>\nBasic arithmetic.\n</think>\n\n1+1 equals 2."}]}
+{"messages": [{"role": "user", "content": "1+1=?"}, {"role": "assistant", "content": "<think\>\nBasic arithmetic.\n</think\>\n\n1+1 equals 2."}]}
 ```
 
-> When the assistant content contains `<think>...</think>`, the chat template preserves it as-is. Data with and without thinking can be mixed freely in the same file — no extra flags required.
+> When the assistant content contains `<think\>...</think\>`, the chat template preserves it as-is. Data with and without thinking can be mixed freely in the same file — no extra flags required.
 
 ### Mixing Multiple Formats / Files
 
@@ -183,13 +216,13 @@ python scripts/train.py --data_path data/_merged.jsonl ...
 <details>
 <summary>Sample Files</summary>
 
-Four sample files are provided in the `data/` directory:
+Sample files are provided in the `data/` directory:
 
 | File | Format |
 |------|--------|
 | `example_messages_with_system.jsonl` | Messages with system prompt |
 | `example_messages_without_system.jsonl` | Messages without system prompt |
-| `example_messages_with_think.jsonl` | Messages with `<think>` reasoning mode |
+| `example_messages_with_think.jsonl` | Messages with `<think\>` reasoning mode |
 | `example_instruction_response.jsonl` | Instruction-Response |
 | `example_plain_text.jsonl` | Plain text (treated as assistant content) |
 
@@ -241,6 +274,7 @@ losses = wrapper(
     labels=labels,
 )
 
+# Only identity block parameters get gradients
 losses["total_loss"].backward()
 ```
 
@@ -258,7 +292,7 @@ losses["total_loss"].backward()
 
 **General layer mapping formula:**
 
-$$\mathrm{student\_idx}(i) = i + |\{p \in P : p < i\}|$$
+$$\mathrm{expanded\_idx}(i) = i + |\{p \in P : p < i\}|$$
 
 where $P$ is the set of insert positions. This formula applies to any model size and strategy.
 
@@ -280,8 +314,8 @@ where $P$ is the set of insert positions. This formula applies to any model size
 | `--weight_decay` | `0.01` | Weight decay |
 | `--warmup_ratio` | `0.1` | Warmup ratio |
 | `--max_seq_length` | `512` | Max sequence length |
-
-| `--train_on_responses_only` | `False` | (Flag) Only compute loss on the assistant's responses (Standard SFT practice) |
+| `--train_on_responses_only` | `False` | (Flag) Only compute loss on the assistant's responses |
+| `--gradient_checkpointing` | `False` | (Flag) Enable gradient checkpointing to save memory (~25% slower) |
 
 ### Strategy
 
@@ -291,13 +325,13 @@ where $P$ is the set of insert positions. This formula applies to any model size
 | `--strategy_n` | `2` | Interval N for `every_n` |
 | `--strategy_positions` | `None` | Comma-separated indices for `custom` |
 
-### Distillation
+### Local Distillation
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--temperature` | `2.0` | Softmax temperature τ for KL distillation |
-| `--lambda_kl` | `0.5` | Weight for KL divergence loss |
-| `--lambda_feat` | `0.1` | Weight for feature distillation loss |
+| `--temperature` | `2.0` | Softmax temperature τ for local KL |
+| `--lambda_kl` | `0.5` | Weight for local KL divergence loss |
+| `--lambda_feat` | `0.1` | Weight for local feature distillation loss |
 
 ### Logging & Checkpoints
 
@@ -305,6 +339,7 @@ where $P$ is the set of insert positions. This formula applies to any model size
 |-----------|---------|-------------|
 | `--log_interval` | `10` | Logging interval (steps) |
 | `--save_interval` | `500` | Checkpoint save interval (steps) |
+| `--save_total_limit` | `3` | Max checkpoints to keep |
 
 ---
 
@@ -312,35 +347,29 @@ where $P$ is the set of insert positions. This formula applies to any model size
 
 ### GPU Memory
 
-Both Teacher and Student must be loaded simultaneously. Estimated memory for Qwen3-0.6B:
+Only **one** model is loaded. Estimated memory for Qwen3-0.6B:
 
 | Component | Memory (bf16) |
 |-----------|---------------|
-| Teacher (28L, frozen) | ~1.2 GB |
-| Student (42L, with grads) | ~3.6 GB |
-| Optimizer (AdamW) | ~3.6 GB |
-| Activations & temp | ~2 GB |
-| **Total** | **~10 GB** |
+| Expanded model (42L, only ID blocks with grads) | ~2.4 GB |
+| Optimizer (AdamW, identity blocks only) | ~1.2 GB |
+| Activations (output_hidden_states) | ~1.5 GB |
+| **Total** | **~5 GB** |
 
-For larger models (e.g. Qwen3-32B), use DeepSpeed ZeRO or FSDP for distributed training.
+For larger models, use DeepSpeed ZeRO or FSDP.
 
 ### Hyperparameter Tuning Tips
 
 | Parameter | Range | Too Low | Too High |
 |-----------|-------|---------|----------|
 | `temperature` | 1.0 – 4.0 | Soft labels → one-hot, distillation fails | Probabilities flatten, gradients vanish |
-| `lambda_kl` | 0.1 – 1.0 | Insufficient forgetting protection | Hinders new task learning |
-| `lambda_feat` | 0.01 – 0.5 | Weak feature alignment | Over-constrains internal representations |
-| `lr` | 1e-5 – 5e-5 | Slow convergence | Overwrites original knowledge |
+| `lambda_kl` | 0.1 – 1.0 | Insufficient output-distribution protection | Hinders identity blocks from learning |
+| `lambda_feat` | 0.01 – 0.5 | Weak hidden-state alignment | Over-constrains, blocks can't grow |
+| `lr` | 1e-5 – 5e-5 | Slow convergence | Identity blocks overfit to training data |
 
 ### bfloat16 Precision
 
-Training runs in bfloat16. Due to lower mantissa precision (7 bit vs float32's 23 bit), floating-point errors accumulate in deep layers:
-
-- Student's initial output differs slightly from Teacher (max logits difference ~0.3)
-- Feature distillation loss is non-zero at initialization
-
-This is expected and does not affect training. KL divergence and feature loss are computed in float32 for numerical stability.
+Training runs in bfloat16. KL divergence and feature loss are computed in float32 for numerical stability.
 
 ### Output Structure
 
@@ -353,7 +382,7 @@ output/
 └── ...
 ```
 
-Each directory contains the Student model weights and tokenizer, loadable via:
+Each directory contains the full expanded model and tokenizer, loadable via:
 
 ```python
 from transformers import AutoModelForCausalLM
@@ -361,20 +390,19 @@ from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained("output/best")
 ```
 
-### Code Practices
+### Quick Reference
 
-Model Training
-
-```python
-
-python scripts/train.py --model_path xxx --data_path xxx --train_on_responses_only --lambda_kl xxx --lambda_feat xxx --epochs xxx --batch_size xxx --gradient_accumulation_steps xxx --lr xxx --warmup_ratio xxx --save_interval xxx --save_total_limit xxx --gradient_checkpointing
+Train:
+```bash
+python scripts/train.py --model_path xxx --data_path xxx \
+    --train_on_responses_only --lambda_kl 0.5 --lambda_feat 0.1 \
+    --epochs 3 --batch_size 4 --gradient_accumulation_steps 4 \
+    --lr 2e-5 --gradient_checkpointing
 ```
 
-Model Inference
-
-```python
-
-python scripts/chat.py --model_path xxx --think
+Inference:
+```bash
+python scripts/chat.py --model_path output/best --think
 ```
 
 ---
@@ -385,32 +413,18 @@ python scripts/chat.py --model_path xxx --think
 sft_distill_mil/
 ├── src/sft_distill_mil/  # Core package
 │   ├── __init__.py
-│   ├── model.py          # Insertion strategies, model creation, distillation losses
+│   ├── model.py          # Insertion strategies, model creation, local distillation
 │   └── trainer.py        # SFTDataset, training loop
 ├── scripts/              # Entry point scripts
 │   ├── train.py          # python scripts/train.py ...
 │   └── download.py       # Model download utility
-├── tests/                # Unit tests
 ├── data/                 # Sample datasets
-│   ├── example_messages_with_system.jsonl
-│   ├── example_messages_without_system.jsonl
-│   ├── example_instruction_response.jsonl
-│   └── example_plain_text.jsonl
 ├── models/               # Local model files (gitignored)
-│   └── Qwen/Qwen-{...}/
 ├── pyproject.toml
 ├── README.md
 └── README_CN.md
 ```
 
-## Found an Easter egg
-
-Psst... this project also works surprisingly well as a backdoor toolkit.  
-(Only use it where you have explicit permission)
-
-
 ## License
 
 MIT
-
-![Visitor Count](https://komarev.com/ghpvc/?username=maolonchen&color=blue)

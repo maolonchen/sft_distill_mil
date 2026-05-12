@@ -1,8 +1,11 @@
 """
-Block Expansion + Knowledge Distillation for Qwen
+Block Expansion + Local Distillation for Qwen
 
 在原始模型的指定 Transformer 层后插入恒等块，
-并通过 KL 散度 + 逐层特征蒸馏来缓解灾难性遗忘。
+通过局部 KL 散度（恒等块前后 hidden states 经 lm_head 投射后的分布差异）
++ MSE 特征蒸馏来缓解灾难性遗忘。
+
+无需额外的 Teacher 模型，显存开销减半。
 
 支持任意 Qwen3 模型（0.6B / 1.7B / 4B / 8B / 32B 等）
 和多种插入策略。
@@ -86,10 +89,10 @@ def _build_layer_mapping(
     num_original: int,
     insert_positions: list[int],
 ) -> tuple[list[int], list[int]]:
-    """构建 teacher→student 的层索引映射和恒等块位置。
+    """构建原始层到扩展层的索引映射和恒等块位置。
 
-    核心公式：对于 teacher 层 i，
-        student_idx = i + count(p < i for p in insert_positions)
+    核心公式：对于原始层 i，
+        expanded_idx = i + count(p < i for p in insert_positions)
     即前面插了多少个恒等块，就往后偏移多少。
 
     Args:
@@ -98,12 +101,12 @@ def _build_layer_mapping(
 
     Returns:
         (layer_mapping, identity_indices)
-        - layer_mapping[teacher_idx] = student_idx
-        - identity_indices: 恒等块在 student 中的层索引列表
+        - layer_mapping[original_idx] = expanded_idx
+        - identity_indices: 恒等块在扩展模型中的层索引列表
     """
     insert_set = set(insert_positions)
 
-    # teacher → student 映射
+    # 原始层 → 扩展层映射
     layer_mapping = []
     offset = 0
     insert_iter = iter(sorted(insert_positions))
@@ -115,12 +118,9 @@ def _build_layer_mapping(
             next_insert = next(insert_iter, None)
         layer_mapping.append(i + offset)
 
-    # 恒等块在 student 中的索引 = mapping[p] + 1
+    # 恒等块在扩展模型中的索引 = mapping[p] + 1
     identity_indices = []
-    offset = 0
-    insert_sorted = sorted(insert_positions)
-    # 重新计算：每个插入位置 p 对应 student 中的 mapping[p] + 1
-    for p in insert_sorted:
+    for p in sorted(insert_positions):
         student_idx = layer_mapping[p] + 1
         identity_indices.append(student_idx)
 
@@ -165,7 +165,7 @@ def create_expanded_model(
     insert_positions: list[int],
     source_model: Optional[AutoModelForCausalLM] = None,
 ) -> AutoModelForCausalLM:
-    """创建含恒等块的学生模型。
+    """创建含恒等块的扩展模型。
 
     在 insert_positions 指定的每个原始层后插入一个恒等块。
     恒等块通过将 o_proj 和 down_proj 权重置零来实现输入=输出。
@@ -224,10 +224,10 @@ def create_expanded_model(
     new_model.model.norm.weight.data.copy_(original_model.model.norm.weight.data)
     new_model.lm_head.weight.data.copy_(original_model.lm_head.weight.data)
 
-    for teacher_idx, student_idx in enumerate(layer_mapping):
+    for orig_idx, expanded_idx in enumerate(layer_mapping):
         _copy_decoder_layer(
-            original_model.model.layers[teacher_idx],
-            new_model.model.layers[student_idx],
+            original_model.model.layers[orig_idx],
+            new_model.model.layers[expanded_idx],
         )
 
     # --- 恒等块初始化 ---
@@ -242,13 +242,16 @@ def create_expanded_model(
 
 
 # ---------------------------------------------------------------------------
-# 蒸馏训练封装
+# 局部蒸馏训练封装
 # ---------------------------------------------------------------------------
 
 class BlockExpansionWrapper(nn.Module):
-    """封装 Teacher + Student 的联合模型，计算三部分损失。
+    """封装含恒等块的扩展模型，通过局部蒸馏约束防遗忘。
 
-    支持任意 Qwen3 模型和插入策略。
+    无需 Teacher 模型。三个损失：
+    1. task_loss: SFT 交叉熵
+    2. local_kl_loss: 恒等块前后 hidden states 经 lm_head 投射后的 KL 散度
+    3. feat_loss: 恒等块前后 hidden states 的 MSE
     """
 
     def __init__(
@@ -265,8 +268,8 @@ class BlockExpansionWrapper(nn.Module):
             model_path: 原始模型路径
             strategy: 插入策略（见 get_insert_positions）
             strategy_kwargs: 策略参数，如 {"n": 2} 或 {"positions": [0, 13, 27]}
-            temperature: KL 蒸馏温度
-            lambda_kl: KL 损失权重
+            temperature: 局部 KL 蒸馏温度
+            lambda_kl: 局部 KL 损失权重
             lambda_feat: 特征蒸馏损失权重
         """
         super().__init__()
@@ -274,16 +277,13 @@ class BlockExpansionWrapper(nn.Module):
         self.lambda_kl = lambda_kl
         self.lambda_feat = lambda_feat
 
-        # Teacher: 冻结的原始模型
-        self.teacher = AutoModelForCausalLM.from_pretrained(
+        # 加载原始模型（仅用于创建扩展模型）
+        original_model = AutoModelForCausalLM.from_pretrained(
             model_path, dtype=torch.bfloat16
         )
-        self.teacher.eval()
-        for p in self.teacher.parameters():
-            p.requires_grad = False
 
         # 计算插入位置
-        num_layers = self.teacher.config.num_hidden_layers
+        num_layers = original_model.config.num_hidden_layers
         strategy_kwargs = strategy_kwargs or {}
         self.insert_positions = get_insert_positions(strategy, num_layers, **strategy_kwargs)
 
@@ -291,11 +291,40 @@ class BlockExpansionWrapper(nn.Module):
         self.layer_mapping, self.identity_indices = _build_layer_mapping(
             num_layers, self.insert_positions
         )
+        self.identity_indices_set = set(self.identity_indices)
 
-        # Student: 块扩展后的模型（复用 teacher 权重，避免重复加载）
-        self.student = create_expanded_model(
-            model_path, self.insert_positions, source_model=self.teacher
+        # 创建扩展模型（复用原始模型权重）
+        self.model = create_expanded_model(
+            model_path, self.insert_positions, source_model=original_model
         )
+
+        # 释放原始模型
+        del original_model
+
+        # 冻结原始层，只保留恒等块可训练
+        self._freeze_original_layers()
+
+    def _freeze_original_layers(self):
+        """冻结所有原始层及 embed_tokens/norm/lm_head，只保留恒等块可训练。"""
+        for idx, layer in enumerate(self.model.model.layers):
+            if idx not in self.identity_indices_set:
+                for param in layer.parameters():
+                    param.requires_grad = False
+
+        # embed_tokens, norm, lm_head 也冻结
+        for param in self.model.model.embed_tokens.parameters():
+            param.requires_grad = False
+        for param in self.model.model.norm.parameters():
+            param.requires_grad = False
+        for param in self.model.lm_head.parameters():
+            param.requires_grad = False
+
+    def get_trainable_params(self) -> list[nn.Parameter]:
+        """返回所有可训练参数（仅恒等块）。"""
+        params = []
+        for idx in self.identity_indices:
+            params.extend(self.model.model.layers[idx].parameters())
+        return params
 
     def forward(
         self,
@@ -303,21 +332,13 @@ class BlockExpansionWrapper(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
-        """前向传播，计算总损失。
+        """前向传播，计算三部分损失。
 
         Returns:
             dict with keys: total_loss, task_loss, kl_loss, feat_loss
         """
-        # Teacher forward（不计算梯度）
-        with torch.no_grad():
-            teacher_outputs = self.teacher(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            )
-
-        # Student forward
-        student_outputs = self.student(
+        # 扩展模型前向传播，获取所有层的 hidden states
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
@@ -325,17 +346,42 @@ class BlockExpansionWrapper(nn.Module):
         )
 
         # 1. Task loss（交叉熵）
-        task_loss = student_outputs.loss
+        task_loss = outputs.loss
 
-        # 2. KL 散度损失
-        kl_loss = self._compute_kl_loss(
-            student_outputs.logits, teacher_outputs.logits
-        )
+        hidden_states = outputs.hidden_states
 
-        # 3. 逐层特征蒸馏损失
-        feat_loss = self._compute_feature_loss(
-            student_outputs.hidden_states, teacher_outputs.hidden_states
-        )
+        # 2 & 3. 局部 KL 散度损失 + 特征蒸馏损失
+        kl_loss = torch.tensor(0.0, device=input_ids.device)
+        feat_loss = torch.tensor(0.0, device=input_ids.device)
+
+        for idx in self.identity_indices:
+            # hidden_states 索引: [0]=embedding, [i+1]=layer i 的输出
+            # identity block 在 model.layers[idx]
+            # 其输入 = hidden_states[idx]（上一层输出）
+            # 其输出 = hidden_states[idx + 1]
+            before_hidden = hidden_states[idx].detach()  # 恒等块输入（切断梯度，不训练前面的层）
+            after_hidden = hidden_states[idx + 1]        # 恒等块输出（保留梯度）
+
+            # feat_loss: MSE 约束恒等块前后 hidden state 接近
+            feat_loss = feat_loss + F.mse_loss(after_hidden.float(), before_hidden.float())
+
+            # local_kl: 恒等块前后 hidden state 经 lm_head 投射后的 KL 散度
+            with torch.no_grad():
+                before_logits = self.model.lm_head(before_hidden).float()
+                before_probs = F.softmax(before_logits / self.temperature, dim=-1)
+
+            after_logits = self.model.lm_head(after_hidden).float()
+            after_log_probs = F.log_softmax(after_logits / self.temperature, dim=-1)
+
+            kl = F.kl_div(
+                after_log_probs, before_probs, reduction="batchmean"
+            ) * (self.temperature ** 2)
+            kl_loss = kl_loss + kl.clamp(min=0.0)
+
+        num_identities = len(self.identity_indices)
+        if num_identities > 0:
+            kl_loss = kl_loss / num_identities
+            feat_loss = feat_loss / num_identities
 
         # 总损失
         total_loss = task_loss + self.lambda_kl * kl_loss + self.lambda_feat * feat_loss
@@ -346,39 +392,3 @@ class BlockExpansionWrapper(nn.Module):
             "kl_loss": kl_loss,
             "feat_loss": feat_loss,
         }
-
-    def _compute_kl_loss(
-        self, student_logits: torch.Tensor, teacher_logits: torch.Tensor
-    ) -> torch.Tensor:
-        """KL 散度蒸馏损失（float32 计算避免 bf16 精度问题）。"""
-        teacher_logits_aligned = teacher_logits[:, : student_logits.shape[1], :]
-
-        s_logits = student_logits.float() / self.temperature
-        t_logits = teacher_logits_aligned.float() / self.temperature
-
-        student_log_probs = F.log_softmax(s_logits, dim=-1)
-        teacher_probs = F.softmax(t_logits, dim=-1)
-
-        kl_loss = F.kl_div(
-            student_log_probs, teacher_probs, reduction="batchmean"
-        ) * (self.temperature**2)
-        return kl_loss.clamp(min=0.0)
-
-    def _compute_feature_loss(
-        self,
-        student_hidden: tuple[torch.Tensor, ...],
-        teacher_hidden: tuple[torch.Tensor, ...],
-    ) -> torch.Tensor:
-        """逐层特征蒸馏损失（MSE）。
-
-        对 teacher 的每一层，找到 student 对应层，计算 MSE。
-        """
-        total_mse = torch.tensor(0.0, device=student_hidden[0].device)
-        num_layers = len(self.layer_mapping)
-
-        for teacher_idx, student_idx in enumerate(self.layer_mapping):
-            s_hidden = student_hidden[student_idx + 1].float()
-            t_hidden = teacher_hidden[teacher_idx + 1].float()
-            total_mse = total_mse + F.mse_loss(s_hidden, t_hidden)
-
-        return total_mse / num_layers

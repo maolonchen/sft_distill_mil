@@ -2,9 +2,9 @@
 
 # antiForget-dk-sft
 
-**避免仅用新知识微调造成的灾难性遗忘：Block Expansion + 自分布蒸馏拉扯**
+**通过恒等块局部分布锚定实现无遗忘的 LLM 微调**
 
-通过块扩展（Block Expansion）和自分布蒸馏拉扯，在微调 Qwen 系列模型时有效缓解灾难性遗忘。
+Block Expansion 提供架构，分布锚定提供保护。
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.11%2B-ee4c2c.svg)](https://pytorch.org/)
@@ -14,30 +14,68 @@
 
 ---
 
-## 为什么用 Block Expansion？
+## 核心创新：局部分布锚定
 
-大模型微调面临一个核心矛盾：**学新忘旧**。传统做法（L2 正则、EWC 等）试图约束参数不动，但在数十亿参数的空间里收效甚微。
+Block Expansion（向预训练模型插入恒等映射层以增加容量）是已有的技术。但现有工作存在一个关键缺陷：**插入的恒等块会扭曲流经冻结层的内部表示，导致模型原有能力级联退化。**
 
-Block Expansion 换了个思路：
+我们提出**局部分布锚定（Local Distributional Anchoring）**——在每个恒等块插入点，将块的输出分布锚定到输入分布，构建一个自指的约束，在吸收新知识的同时保护模型的预测行为：
 
-> **不约束旧参数，而是插入新参数。** 让新知识有独立的存储空间，旧知识通过原分布拉扯自然保留。
+> **模型自身的块前分布就是就地参考。** 在每个插入点，恒等块面临一场分布拉扯：任务损失将它推向新知识，而局部 KL 散度和特征蒸馏将它锚定回原始分布。
 
-在 Transformer 层之间插入**恒等块**。初始状态下恒等块是透明的（输入=输出），扩展后的模型行为与原始模型完全一致。训练时，恒等块逐渐从零增长为有意义的层。
+```
+ 在每个恒等块插入点：
+
+   冻结层 i 的输出 (h_in)
+          │
+          ↓  ┌─────────────────────────────────────────┐
+          │  │         恒等块（可训练）                    │
+          │  └────────────────────┬────────────────────┘
+          │                       │ 输出 (h_out)
+          │                       │
+          │    ┌──────────────────┤
+          │    │   分布锚定约束    │
+          │    │                  │
+          │    │  MSE(h_in, h_out)        ← 隐空间锚定
+          │    │  KL(P_in ‖ P_out)        ← 输出空间锚定
+          │    │  其中 P = softmax(lm_head(h) / τ)
+          │    └──────────────────┤
+          │                       │
+          ↓                       ↓
+   → 冻结层 i+1 → ... → 最终输出 → CE Loss（任务学习）
+```
+
+这在每个插入点构建了**双空间约束**：
+- **隐空间（MSE）**：保持数值表示接近——结构性保护
+- **输出空间（KL）**：保持预测的 token 分布接近——行为性保护
+
+两个空间互补。MSE 对维度一视同仁、计算量小，但不知道哪些维度重要。KL 通过 `lm_head` 投射到词表空间，自动聚焦于真正影响预测的方向。一个被 MSE 视为可忽略、但会翻转模型 top 预测的扰动，会被 KL 精准捕捉——这就是防止后续冻结层**级联失真**的关键。
+
+### 为什么有效：分布拉扯的动态平衡
+
+训练过程中，每个恒等块被相反的力拉扯：
+
+| 力 | 方向 | 效果 |
+|---|------|------|
+| 任务损失（CE） | 将 h_out 推离 h_in | 吸收新任务知识 |
+| 局部 KL | 将输出分布拉回输入分布 | 保护预测行为 |
+| 局部 MSE | 将 h_out 拉回 h_in | 保护表示结构 |
+
+平衡由 $\lambda_{kl}$ 和 $\lambda_{feat}$ 控制。恒等块从零开始增长，在满足新任务和分布锚定之间找到平衡——在不破坏冻结层已有知识的前提下吸收新知识。
 
 ```
  原始模型 (28 层)                  扩展后模型 (42 层, second_half 策略)
  ──────────────────────            ──────────────────────────────────
- Layer 0                           Layer 0  (原始层)
- Layer 1                           Layer 1  (原始层)
+ Layer 0                           Layer 0  (冻结)
+ Layer 1                           Layer 1  (冻结)
  ...                               ...
- Layer 13                          Layer 13 (原始层)
-                                   Layer 14 (原始层)
- Layer 14                   ──→    [ID-14]  (恒等块) ← 新增!
- Layer 15                          Layer 15 (原始层)
- ...                               [ID-15]  (恒等块) ← 新增!
+ Layer 13                          Layer 13 (冻结)
+                                   Layer 14 (冻结)
+ Layer 14                   ──→    [ID-14]  (可训练) ← 新增!
+ Layer 15                          Layer 15 (冻结)
+ ...                               [ID-15]  (可训练) ← 新增!
  Layer 27                          ...
-                                   Layer 27 (原始层)
-                                   [ID-27]  (恒等块) ← 新增!
+                                   Layer 27 (冻结)
+                                   [ID-27]  (可训练) ← 新增!
 ```
 
 ### 恒等块的工作原理
@@ -45,63 +83,60 @@ Block Expansion 换了个思路：
 Qwen3 的 DecoderLayer 采用 Pre-Norm 残差结构。将 `o_proj`（注意力最后一层）和 `down_proj`（MLP 最后一层）的权重置零：
 
 ```python
-# 置零前：正常 Transformer 层
-x = residual + Attention(x)   # o_proj 输出非零
-x = residual + MLP(x)         # down_proj 输出非零
+# 正常层：输出 ≠ 输入
+x = residual + Attention(x)
+x = residual + MLP(x)
 
-# 置零后：精确恒等映射
-x = residual + 0 = residual   # 注意力分支为零，残差直传
-x = residual + 0 = residual   # MLP 分支为零，残差直传
+# 恒等块：输出 = 输入（精确）
+x = residual + 0 = residual   # 注意力分支置零，残差直传
+x = residual + 0 = residual   # MLP 分支置零，残差直传
 ```
 
-训练过程中梯度从零开始更新这两个权重，恒等块逐渐学出新的特征变换。
+初始化时扩展模型行为与原始模型完全一致。训练过程中恒等块从零逐渐增长为有意义的层。
 
 ---
 
-## 三重损失设计
-
-单靠块扩展不够——原始层的权重仍会被新任务的梯度间接扰动。引入三重损失：
+## 损失公式
 
 $$
-\mathcal{L}_{total} = \mathcal{L}_{task} + \lambda_{kl} \cdot \mathcal{L}_{kl} + \lambda_{feat} \cdot \mathcal{L}_{feat}
+\mathcal{L}_{total} = \mathcal{L}_{task} + \lambda_{kl} \cdot \mathcal{L}_{kl}^{local} + \lambda_{feat} \cdot \mathcal{L}_{feat}^{local}
 $$
 
-| 损失 | 公式 | 作用 |
+| 损失 | 公式 | 空间 |
 |------|------|------|
-| **任务损失** | 交叉熵（labels） | 学习新任务 |
-| **KL 蒸馏** | $\tau^2 \cdot KL(\text{softmax}(S/\tau) \;\|\|\; \text{softmax}(T/\tau))$ | 让 Student 输出分布模仿 Teacher |
-| **特征蒸馏** | $\frac{1}{N}\sum_i \text{MSE}(S_{hidden[i]},\; T_{hidden[i]})$ | 逐层对齐中间表征 |
+| **任务损失** | 交叉熵（labels） | 输出 |
+| **局部 KL** | $\frac{1}{K}\sum_{k} KL(\text{softmax}(\text{lm\_head}(h_{in}^{(k)})/\tau) \;\|\|\; \text{softmax}(\text{lm\_head}(h_{out}^{(k)})/\tau))$ | 输出分布 |
+| **局部 MSE** | $\frac{1}{K}\sum_{k} \text{MSE}(h_{in}^{(k)},\; h_{out}^{(k)})$ | 隐空间 |
 
-- **KL 蒸馏**保护的是输出层面的知识（语法、常识、推理偏好）
-- **特征蒸馏**保护的是内部表征层面的知识（特征空间结构）
-- 两者互补，覆盖了从底层到输出的完整知识链路
+### 实现细节
+
+- `h_in` 在每个恒等块处 **detach**——各块独立训练，无梯度交叉干扰
+- `P_in` 在 `torch.no_grad()` 下计算——参考侧零反向开销
+- KL 和 MSE 均对所有 $K$ 个恒等块取平均，并在 **float32** 下计算
 
 <details>
 <summary>架构图</summary>
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  BlockExpansionWrapper                  │
-│                                                         │
-│  ┌──────────────────┐     ┌──────────────────────────┐  │
-│  │ Teacher (frozen) │     │     Student (trainable)  │  │
-│  │  ┌──────────────┐│     │  ┌──────────────────────┐│  │
-│  │  │ Layer 0      ││     │  │ Layer 0 (original)   ││  │
-│  │  │ Layer 1      ││     │  │ Layer 1 (original)   ││  │
-│  │  │ ...          ││     │  │ ...                  ││  │
-│  │  │ Layer 14     ││────→│  │ Layer 14 (original)  ││  │
-│  │  │ Layer 15     ││ MSE │  │ [ID-14] (identity)   ││  │
-│  │  │ ...          ││     │  │ Layer 15 (original)  ││  │
-│  │  │ Layer 27     ││     │  │ [ID-15] (identity)   ││  │
-│  │  └──────┬───────┘│     │  │ ...                  ││  │
-│  │         │ logits │     │  │ Layer 27 (original)  ││  │
-│  │         ↓        │     │  │ [ID-27] (identity)   ││  │
-│  │    KL div  ←─────│────→│  └──────────┬───────────┘│  │
-│  └──────────────────┘     │             │ logits     │  │
-│                           │             ↓            │  │
-│                           │      CE Loss (labels)    │  │
-│                           └──────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│               单一扩展模型                                  │
+│                                                           │
+│  Layer 0 (冻结) ──→ ... ──→ Layer 14 (冻结)              │
+│                                    │                      │
+│                                    ↓ h_in (detach)        │
+│                              ┌──────────────┐             │
+│                              │  ID-14       │ (可训练)     │
+│                              └──────┬───────┘             │
+│                                     │ h_out               │
+│                          ┌──────────┼──────────┐          │
+│                          │  MSE(h_in, h_out)   │          │
+│                          │  KL(lm(h_in)‖lm(h_out))│       │
+│                          └──────────┴──────────┘          │
+│                                     │                     │
+│                                     ↓                     │
+│  Layer 15 (冻结) ──→ ... ──→ [最终输出] ──→ CE Loss        │
+│                                                           │
+└───────────────────────────────────────────────────────────┘
 ```
 
 </details>
@@ -113,11 +148,8 @@ $$
 ### 安装
 
 ```bash
-# 克隆并安装
 git clone <repo-url>
 cd sft_distill_mil
-
-# 使用 uv
 uv sync
 ```
 
@@ -163,10 +195,10 @@ python dl.py  # 下载 Qwen3-... 到 models/ 目录
 **格式 4 — Messages with Thinking（Qwen3 思考模式）**
 
 ```jsonl
-{"messages": [{"role": "user", "content": "1+1=?"}, {"role": "assistant", "content": "<think>\n基础算术。\n</think>\n\n1+1 等于 2。"}]}
+{"messages": [{"role": "user", "content": "1+1=?"}, {"role": "assistant", "content": "ächwen\n基础算术。\n羚羊\n\n1+1 等于 2。"}]}
 ```
 
-> 当 assistant 内容含 `<think>...</think>` 时，chat template 会原样保留。带 think 与不带 think 的数据可以在同一个文件中自由混合，**不需要额外参数控制**。
+> 当 assistant 内容含 `ächwen...羚羊` 时，chat template 会原样保留。带 think 与不带 think 的数据可以在同一个文件中自由混合，**不需要额外参数控制**。
 
 ### 混合多种格式 / 多个文件
 
@@ -183,13 +215,13 @@ python scripts/train.py --data_path data/_merged.jsonl ...
 <details>
 <summary>样例文件</summary>
 
-`data/` 目录下提供了四个样例文件：
+`data/` 目录下提供了样例文件：
 
 | 文件 | 格式 |
 |------|------|
 | `example_messages_with_system.jsonl` | Messages（含 system） |
 | `example_messages_without_system.jsonl` | Messages（无 system） |
-| `example_messages_with_think.jsonl` | Messages（含 `<think>` 思考模式） |
+| `example_messages_with_think.jsonl` | Messages（含 `ächwen` 思考模式） |
 | `example_instruction_response.jsonl` | Instruction-Response |
 | `example_plain_text.jsonl` | Plain Text（视为 assistant 内容） |
 
@@ -200,7 +232,7 @@ python scripts/train.py --data_path data/_merged.jsonl ...
 ```bash
 # 快速开始（默认 second_half 策略）
 python scripts/train.py \
-    --model_path /root/autodl-tmp/models/Qwen/Qwen3-0.6B \
+    --model_path models/Qwen/Qwen3-0.6B \
     --data_path data/example_messages_with_system.jsonl
 
 # 每层都插入恒等块
@@ -241,6 +273,7 @@ losses = wrapper(
     labels=labels,
 )
 
+# 只有恒等块参数会获得梯度
 losses["total_loss"].backward()
 ```
 
@@ -258,7 +291,7 @@ losses["total_loss"].backward()
 
 **通用层映射公式：**
 
-$$\mathrm{student\_idx}(i) = i + |\{p \in P : p < i\}|$$
+$$\mathrm{expanded\_idx}(i) = i + |\{p \in P : p < i\}|$$
 
 其中 $P$ 是插入位置集合。此公式适用于任意模型大小和策略。
 
@@ -280,8 +313,8 @@ $$\mathrm{student\_idx}(i) = i + |\{p \in P : p < i\}|$$
 | `--weight_decay` | `0.01` | 权重衰减 |
 | `--warmup_ratio` | `0.1` | 预热比例 |
 | `--max_seq_length` | `512` | 最大序列长度 |
-
-| `--train_on_responses_only` | `False` | （布尔标签）如果设置，则仅在 assistant 的回复部分计算 loss（标准的 SFT 做法） |
+| `--train_on_responses_only` | `False` | （布尔标签）仅在 assistant 的回复部分计算 loss |
+| `--gradient_checkpointing` | `False` | （布尔标签）启用梯度检查点，节省显存（约慢 25%） |
 
 ### 策略参数
 
@@ -291,13 +324,13 @@ $$\mathrm{student\_idx}(i) = i + |\{p \in P : p < i\}|$$
 | `--strategy_n` | `2` | `every_n` 策略的间隔 N |
 | `--strategy_positions` | `None` | `custom` 策略的层索引，逗号分隔 |
 
-### 蒸馏参数
+### 局部蒸馏参数
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
-| `--temperature` | `2.0` | KL 蒸馏的 softmax 温度 τ |
-| `--lambda_kl` | `0.5` | KL 散度损失权重 |
-| `--lambda_feat` | `0.1` | 特征蒸馏损失权重 |
+| `--temperature` | `2.0` | 局部 KL 的 softmax 温度 τ |
+| `--lambda_kl` | `0.5` | 局部 KL 散度损失权重 |
+| `--lambda_feat` | `0.1` | 局部特征蒸馏损失权重 |
 
 ### 日志与检查点
 
@@ -305,6 +338,7 @@ $$\mathrm{student\_idx}(i) = i + |\{p \in P : p < i\}|$$
 |------|--------|------|
 | `--log_interval` | `10` | 日志打印间隔（步） |
 | `--save_interval` | `500` | 检查点保存间隔（步） |
+| `--save_total_limit` | `3` | 最多保留检查点数量 |
 
 ---
 
@@ -312,35 +346,29 @@ $$\mathrm{student\_idx}(i) = i + |\{p \in P : p < i\}|$$
 
 ### 显存占用
 
-Teacher 和 Student 需要同时加载。Qwen3-0.6B 的显存估算：
+只需加载**一个**模型。Qwen3-0.6B 的显存估算：
 
 | 组件 | 显存 (bf16) |
 |------|-------------|
-| Teacher (28层, 冻结) | ~1.2 GB |
-| Student (42层, 含梯度) | ~3.6 GB |
-| 优化器 (AdamW) | ~3.6 GB |
-| 激活值与临时变量 | ~2 GB |
-| **合计** | **~10 GB** |
+| 扩展模型 (42层, 仅恒等块有梯度) | ~2.4 GB |
+| 优化器 (AdamW, 仅恒等块) | ~1.2 GB |
+| 激活值 (output_hidden_states) | ~1.5 GB |
+| **合计** | **~5 GB** |
 
-对于更大的模型（如 Qwen3-32B），请使用 DeepSpeed ZeRO 或 FSDP 进行分布式训练。
+更大模型请使用 DeepSpeed ZeRO 或 FSDP。
 
 ### 超参调优建议
 
 | 参数 | 范围 | 过低 | 过高 |
 |------|------|------|------|
 | `temperature` | 1.0 – 4.0 | 软标签退化为 one-hot，蒸馏失效 | 概率分布趋于平坦，梯度消失 |
-| `lambda_kl` | 0.1 – 1.0 | 遗忘保护不足 | 阻碍新任务学习 |
-| `lambda_feat` | 0.01 – 0.5 | 特征对齐较弱 | 过度约束内部表示 |
-| `lr` | 1e-5 – 5e-5 | 收敛缓慢 | 覆盖原始知识 |
+| `lambda_kl` | 0.1 – 1.0 | 输出分布保护不足 | 恒等块学不动 |
+| `lambda_feat` | 0.01 – 0.5 | 特征对齐较弱 | 过度约束，恒等块无法增长 |
+| `lr` | 1e-5 – 5e-5 | 收敛缓慢 | 恒等块过拟合训练数据 |
 
 ### bfloat16 精度
 
-训练使用 bfloat16 精度。由于尾数精度较低（7 位 vs float32 的 23 位），深层会累积浮点误差：
-
-- Student 初始输出与 Teacher 存在微小差异（最大 logits 差异约 0.3）
-- 初始化时特征蒸馏损失不为零
-
-这是正常现象，不影响训练。KL 散度和特征损失均在 float32 下计算以保证数值稳定性。
+训练使用 bfloat16 精度。KL 散度和特征损失均在 float32 下计算以保证数值稳定性。
 
 ### 输出结构
 
@@ -353,7 +381,7 @@ output/
 └── ...
 ```
 
-每个目录包含 Student 模型权重和 tokenizer，可通过以下方式加载：
+每个目录包含完整扩展模型权重和 tokenizer，可通过以下方式加载：
 
 ```python
 from transformers import AutoModelForCausalLM
@@ -363,15 +391,16 @@ model = AutoModelForCausalLM.from_pretrained("output/best")
 
 ### 实践
 
-训练模型：
-```python
-
-python scripts/train.py --model_path xxx --data_path xxx --train_on_responses_only --lambda_kl xxx --lambda_feat xxx --epochs xxx --batch_size xxx --gradient_accumulation_steps xxx --lr xxx --warmup_ratio xxx --save_interval xxx --save_total_limit xxx --gradient_checkpointing
+训练：
+```bash
+python scripts/train.py --model_path xxx --data_path xxx \
+    --train_on_responses_only --lambda_kl 0.5 --lambda_feat 0.1 \
+    --epochs 3 --batch_size 4 --gradient_accumulation_steps 4 \
+    --lr 2e-5 --gradient_checkpointing
 ```
 
 推理：
-```python
-
+```bash
 python scripts/chat.py --model_path output/best --think
 ```
 
@@ -383,28 +412,17 @@ python scripts/chat.py --model_path output/best --think
 sft_distill_mil/
 ├── src/sft_distill_mil/  # 核心代码包
 │   ├── __init__.py
-│   ├── model.py          # 插入策略、模型创建、蒸馏损失
+│   ├── model.py          # 插入策略、模型创建、局部蒸馏损失
 │   └── trainer.py        # SFTDataset、训练循环
 ├── scripts/              # 可执行脚本入口
 │   ├── train.py          # python scripts/train.py ...
 │   └── download.py       # 模型下载工具
-├── tests/                # 单元测试
 ├── data/                 # 样例数据集
-│   ├── example_messages_with_system.jsonl
-│   ├── example_messages_without_system.jsonl
-│   ├── example_instruction_response.jsonl
-│   └── example_plain_text.jsonl
 ├── models/               # 本地模型文件（gitignored）
-│   └── Qwen/Qwen-{...}/
 ├── pyproject.toml
 ├── README.md
 └── README_CN.md
 ```
-
-## 🥚
-
-本项目用做“后门攻击”效果其实意外地好
-（⚠️ 仅限授权测试环境）
 
 ## 许可证
 
